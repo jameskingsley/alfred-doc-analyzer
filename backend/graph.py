@@ -14,9 +14,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# MEMORY & MODEL INITIALIZATION 
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-vector_db = Chroma(persist_directory="./vector_db", embedding_function=embeddings)
+# GLOBAL INITIALIZATION (Lazy Loaded for Production)
+_embeddings = None
+_vector_db = None
+
+def get_vector_db():
+    """Lazy loader to prevent startup timeouts on Render."""
+    global _embeddings, _vector_db
+    if _vector_db is None:
+        if _embeddings is None:
+            # Only loads when the first request is made
+            _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        
+        # Using absolute path for stable container performance
+        db_path = os.path.join(os.getcwd(), "vector_db")
+        _vector_db = Chroma(persist_directory=db_path, embedding_function=_embeddings)
+    return _vector_db
+
+# LLM stays global (lightweight API wrapper)
 llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 
 # STATE DEFINITION
@@ -27,7 +42,7 @@ class AgentState(TypedDict):
     context_data: Optional[str]  
     review_count: int            
 
-# --- 3. SPECIALIZED TOOLS ---
+# SPECIALIZED TOOLS
 
 def extract_all_formats(file_path: str) -> str:
     if not file_path or not os.path.exists(file_path):
@@ -42,34 +57,37 @@ def extract_all_formats(file_path: str) -> str:
             text = "\n".join([para.text for para in doc.paragraphs])
         elif ext in [".csv", ".xlsx"]:
             df = pd.read_csv(file_path) if ext == ".csv" else pd.read_excel(file_path)
-            text = df.head(50).to_markdown() # Increased context for CSVs
+            text = df.head(50).to_markdown() 
         elif ext in [".txt", ".md"]:
             with open(file_path, "r", encoding="utf-8") as f:
                 text = f.read()
     except Exception as e:
         return f"Error extracting text: {str(e)}"
-    
     return text
 
 def archive_document(file_path: str):
     content = extract_all_formats(file_path)
     if not content or "Error" in content: return
     
+    vdb = get_vector_db()
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     chunks = splitter.split_text(content)
-    vector_db.add_texts(texts=chunks, metadatas=[{"source": file_path}] * len(chunks))
+    vdb.add_texts(texts=chunks, metadatas=[{"source": file_path}] * len(chunks))
 
-# AGENT NODES 
+#  AGENT NODES
 
 def supervisor_node(state: AgentState):
+    # Only archive if a file is present and it's the start of a thread
     if state.get("input_file") and not state.get("messages"):
         archive_document(state["input_file"])
 
+    vdb = get_vector_db()
     query = state["messages"][-1].content
-    docs = vector_db.similarity_search(query, k=5) # Increased k for better retrieval
+    docs = vdb.similarity_search(query, k=5) 
     memory_context = "\n---\n".join([d.page_content for d in docs])
 
-    file_name = str(state['input_file']).lower()
+    # Improved safe-get for input_file
+    file_name = str(state.get('input_file', '')).lower()
     if any(keyword in file_name for keyword in ["resume", "cv", "kingsley"]):
         dest = "resume_specialist"
     else:
@@ -78,12 +96,10 @@ def supervisor_node(state: AgentState):
     return {"next_agent": dest, "context_data": memory_context, "review_count": 0}
 
 def resume_specialist(state: AgentState):
-    # FALLBACK: If memory is empty, extract directly from the file
     current_content = extract_all_formats(state["input_file"])
-    
     prompt = (
         "You are a Senior Recruiter. Analyze the resume provided below. "
-        "Use the ARCHIVED MEMORY to add context about the candidate's history if available. "
+        "Use the ARCHIVED MEMORY to add context about the candidate's history. "
         f"\n\n[RESUME CONTENT]:\n{current_content}"
         f"\n\n[ARCHIVED MEMORY]:\n{state['context_data']}"
     )
@@ -92,10 +108,9 @@ def resume_specialist(state: AgentState):
 
 def document_analyst(state: AgentState):
     current_content = extract_all_formats(state["input_file"])
-    
     prompt = (
         "You are a Senior Data Analyst. Analyze this document meticulously. "
-        "Reference specific data points and relate findings to the user's background in the archives."
+        "Reference data points and relate findings to the archives."
         f"\n\n[DOCUMENT CONTENT]:\n{current_content}"
         f"\n\n[ARCHIVED MEMORY]:\n{state['context_data']}"
     )
@@ -105,9 +120,8 @@ def document_analyst(state: AgentState):
 def reviewer_node(state: AgentState):
     last_report = state["messages"][-1].content
     review_prompt = (
-        "You are Alfred, the Reviewer. Check the report for accuracy. "
-        "If it accurately reflects the source data, reply 'APPROVED'. "
-        "Otherwise, specify the correction. "
+        "You are Alfred, the Reviewer. Check for accuracy. "
+        "Reply 'APPROVED' if correct, otherwise specify corrections. "
         f"\n\n[REPORT]:\n{last_report}"
     )
     review_decision = llm.invoke([SystemMessage(content=review_prompt)])
@@ -117,7 +131,7 @@ def reviewer_node(state: AgentState):
     
     return {"next_agent": "document_analyst", "review_count": state["review_count"] + 1}
 
-# GRAPH CONSTRUCTION 
+# GRAPH CONSTRUCTION
 
 builder = StateGraph(AgentState)
 builder.add_node("supervisor", supervisor_node)
